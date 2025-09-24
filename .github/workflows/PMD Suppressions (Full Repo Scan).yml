@@ -1,0 +1,124 @@
+# .github/workflows/pmd-suppression-full-scan.yml
+name: "Policy: PMD Suppressions (Full Repo Scan)"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "force-app/**"
+      - ".github/workflows/pmd-suppression-full-scan.yml"
+      - ".github/pmd-suppression-allowlist.txt"
+  push:
+    branches: [main, develop, release/**]
+    paths:
+      - "force-app/**"
+
+jobs:
+  pmd_suppression_full_scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: PMD suppression scan (full repo, no shell script)
+        id: pmdscan
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { execSync } = require('child_process');
+
+            // Config
+            const ALLOWLIST = '.github/pmd-suppression-allowlist.txt';
+            const APEX_EXTS = new Set(['.cls', '.trigger', '.apex']);
+            const IGNORE_PATH_RE = new RegExp('(^|/)(test|tests|mock|mocks)/', 'i');
+            const PATTERN_RE = /@SuppressWarnings\b|NOPMD\b|NOSONAR\b|\/\/\s*PMD\b/;
+
+            // Load allowlist (repo-relative paths; one per line; comments allowed)
+            const allowed = new Set();
+            if (fs.existsSync(ALLOWLIST)) {
+              for (const line of fs.readFileSync(ALLOWLIST, 'utf8').split(/\r?\n/)) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith('#')) continue;
+                // take first token as path
+                allowed.add(trimmed.split(/\s+/)[0]);
+              }
+            }
+
+            // Get all tracked files with Apex extensions (full repo)
+            const list = execSync(`git ls-files`, { encoding: 'utf8' })
+              .split(/\r?\n/)
+              .filter(Boolean)
+              .filter(f => APEX_EXTS.has(path.extname(f)));
+
+            if (list.length === 0) {
+              core.info('No Apex files found; skipping PMD suppression gate.');
+              return;
+            }
+
+            core.info(`Scanning ${list.length} Apex file(s) for suppression markers...`);
+
+            const violations = [];
+
+            for (const f of list) {
+              // Ignore tests/mocks by path
+              if (IGNORE_PATH_RE.test(f)) continue;
+              if (!fs.existsSync(f)) continue;
+
+              let text;
+              try {
+                text = fs.readFileSync(f, 'utf8');
+              } catch {
+                continue;
+              }
+
+              // Skip @IsTest files
+              if (/@IsTest\b/.test(text)) continue;
+
+              // Already allowlisted?
+              if (allowed.has(f)) continue;
+
+              const lines = text.split(/\r?\n/);
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (PATTERN_RE.test(line)) {
+                  violations.push(`${f}:${i + 1}: ${line.trim()}`);
+                }
+              }
+            }
+
+            if (violations.length > 0) {
+              const body = [
+                '⚠️ **PMD suppression markers found (unapproved).**',
+                '',
+                'Blocked patterns: `@SuppressWarnings`, `NOPMD`, `NOSONAR`, and `// PMD`.',
+                'If a rare exception is necessary, add the repo-relative file path to',
+                '`.github/pmd-suppression-allowlist.txt` with a JIRA reference and an expiry date,',
+                'and include a justification in the PR description.',
+                '',
+                '**Findings:**',
+                '```',
+                ...violations.slice(0, 200), // safety cap
+                '```'
+              ].join('\n');
+
+              // Comment on PR if available
+              if (context.eventName === 'pull_request') {
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: context.issue.number,
+                  body
+                });
+              }
+
+              core.setFailed(`Unapproved PMD suppressions detected in ${violations.length} location(s).`);
+            } else {
+              core.info('✅ No unapproved PMD suppressions detected.');
+            }
