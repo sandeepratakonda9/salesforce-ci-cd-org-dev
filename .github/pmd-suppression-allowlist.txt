@@ -1,0 +1,4 @@
+# PMD suppression allowlist (rare exceptions only)
+# One path per line. Include a ticket reference and expiry date in a trailing comment.
+# Example:
+# force-app/main/default/classes/LegacyIntegration.cls  # COP-1234 until 2025-12-31
